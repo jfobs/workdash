@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from datetime import date
 from io import BytesIO
 from typing import Any
 
@@ -17,33 +19,22 @@ EXTRACTION_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "lease_id": {"type": "string"},
-                    "lease_name": {"type": "string"},
-                    "classification": {"type": "string", "enum": ["operating", "finance"]},
-                    "commencement_date": {"type": "string", "description": "YYYY-MM-DD"},
-                    "payment_frequency": {"type": "string", "enum": ["monthly"]},
-                    "payment_amount": {"type": "number"},
-                    "payment_timing": {"type": "string", "enum": ["EOM", "BOM"]},
-                    "lease_term_months": {"type": "integer"},
-                    "annual_discount_rate": {"type": "number"},
-                    "lease_incentives": {"type": "number"},
-                    "initial_direct_costs": {"type": "number"},
-                    "prepaid_rent": {"type": "number"},
-                    "residual_value_guarantee": {"type": "number"},
-                    "variable_payment_amount": {"type": "number"},
-                    "nonlease_component_payment": {"type": "number"},
+                    "lease_id": {"type": ["string", "null"]},
+                    "lease_name": {"type": ["string", "null"]},
+                    "classification": {"type": ["string", "null"], "enum": ["operating", "finance", None]},
+                    "commencement_date": {"type": ["string", "null"], "description": "YYYY-MM-DD"},
+                    "payment_frequency": {"type": ["string", "null"], "enum": ["monthly", None]},
+                    "payment_amount": {"type": ["number", "null"]},
+                    "payment_timing": {"type": ["string", "null"], "enum": ["EOM", "BOM", None]},
+                    "lease_term_months": {"type": ["integer", "null"]},
+                    "annual_discount_rate": {"type": ["number", "null"]},
+                    "lease_incentives": {"type": ["number", "null"]},
+                    "initial_direct_costs": {"type": ["number", "null"]},
+                    "prepaid_rent": {"type": ["number", "null"]},
+                    "residual_value_guarantee": {"type": ["number", "null"]},
+                    "variable_payment_amount": {"type": ["number", "null"]},
+                    "nonlease_component_payment": {"type": ["number", "null"]},
                 },
-                "required": [
-                    "lease_id",
-                    "lease_name",
-                    "classification",
-                    "commencement_date",
-                    "payment_frequency",
-                    "payment_amount",
-                    "payment_timing",
-                    "lease_term_months",
-                    "annual_discount_rate",
-                ],
             },
         }
     },
@@ -63,6 +54,83 @@ def read_pdf_text(pdf_bytes: bytes) -> str:
     return "\n\n".join(pages)
 
 
+def _extract_first_amount(text: str) -> float | None:
+    m = re.search(r"\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d{1,2})?)", text)
+    if not m:
+        m = re.search(r"(?:rent|payment)[^\d]{0,20}([0-9]{3,}(?:\.\d{1,2})?)", text, flags=re.I)
+    if not m:
+        return None
+    return float(m.group(1).replace(",", ""))
+
+
+def _extract_term_months(text: str) -> int | None:
+    mo = re.search(r"(\d{1,3})\s*month", text, flags=re.I)
+    if mo:
+        return int(mo.group(1))
+    yr = re.search(r"(\d{1,2})\s*year", text, flags=re.I)
+    if yr:
+        return int(yr.group(1)) * 12
+    return None
+
+
+def _fallback_lease_from_text(text: str) -> dict[str, Any] | None:
+    amount = _extract_first_amount(text)
+    term = _extract_term_months(text)
+    if not amount or not term:
+        return None
+    return {
+        "lease_id": "LEASE-1",
+        "lease_name": "Extracted Lease",
+        "classification": "operating",
+        "commencement_date": date.today().isoformat(),
+        "payment_frequency": "monthly",
+        "payment_amount": amount,
+        "payment_timing": "EOM",
+        "lease_term_months": term,
+        "annual_discount_rate": 0.05,
+        "lease_incentives": 0.0,
+        "initial_direct_costs": 0.0,
+        "prepaid_rent": 0.0,
+        "residual_value_guarantee": 0.0,
+        "variable_payment_amount": 0.0,
+        "nonlease_component_payment": 0.0,
+    }
+
+
+def _normalize_extracted_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for i, row in enumerate(rows, start=1):
+        payment_amount = row.get("payment_amount")
+        lease_term = row.get("lease_term_months")
+        if payment_amount in (None, "") or lease_term in (None, ""):
+            continue
+        payment_amount = float(payment_amount)
+        lease_term = int(lease_term)
+        if payment_amount <= 0 or lease_term <= 0:
+            continue
+
+        normalized.append(
+            {
+                "lease_id": (row.get("lease_id") or f"LEASE-{i}"),
+                "lease_name": (row.get("lease_name") or f"Extracted Lease {i}"),
+                "classification": row.get("classification") or "operating",
+                "commencement_date": row.get("commencement_date") or date.today().isoformat(),
+                "payment_frequency": row.get("payment_frequency") or "monthly",
+                "payment_amount": payment_amount,
+                "payment_timing": row.get("payment_timing") or "EOM",
+                "lease_term_months": lease_term,
+                "annual_discount_rate": float(row.get("annual_discount_rate") or 0.05),
+                "lease_incentives": float(row.get("lease_incentives") or 0),
+                "initial_direct_costs": float(row.get("initial_direct_costs") or 0),
+                "prepaid_rent": float(row.get("prepaid_rent") or 0),
+                "residual_value_guarantee": float(row.get("residual_value_guarantee") or 0),
+                "variable_payment_amount": float(row.get("variable_payment_amount") or 0),
+                "nonlease_component_payment": float(row.get("nonlease_component_payment") or 0),
+            }
+        )
+    return normalized
+
+
 def extract_leases_from_pdf(
     pdf_bytes: bytes,
     model: str = "gpt-5.2",
@@ -77,11 +145,11 @@ def extract_leases_from_pdf(
 
     prompt = (
         "Extract lease key terms from this lease contract text. "
-        "Return only values that are explicit in the text. "
-        "If value missing, use defaults: payment_frequency='monthly', payment_timing='EOM', "
-        "lease_incentives=0, initial_direct_costs=0, prepaid_rent=0, residual_value_guarantee=0, "
-        "variable_payment_amount=0, nonlease_component_payment=0. "
-        "classification must be operating or finance. annual_discount_rate should be decimal like 0.05.\n\n"
+        "Return best-effort structured lease rows even if some fields are uncertain. "
+        "Map terms like base rent/monthly rent to payment_amount. "
+        "Map initial term (years or months) to lease_term_months. "
+        "Map start/commencement date to commencement_date in YYYY-MM-DD. "
+        "Use only 'operating' or 'finance' classification.\n\n"
         f"LEASE TEXT:\n{text[:120000]}"
     )
 
@@ -99,4 +167,9 @@ def extract_leases_from_pdf(
         },
     )
     payload = json.loads(response.output_text)
-    return payload.get("leases", [])
+    normalized = _normalize_extracted_rows(payload.get("leases", []))
+    if normalized:
+        return normalized
+
+    fallback = _fallback_lease_from_text(text)
+    return [fallback] if fallback else []

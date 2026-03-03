@@ -90,3 +90,25 @@ def test_pdf_extraction_requires_api_key(monkeypatch):
         assert "OPENAI_API_KEY" in str(exc)
     else:
         raise AssertionError("Expected RuntimeError when key missing")
+
+
+def test_pdf_normalize_keeps_usable_rows():
+    from ai.pdf_ingest import _normalize_extracted_rows
+
+    rows = [
+        {"lease_name": "X", "payment_amount": 2500, "lease_term_months": 60},
+        {"lease_name": "Y", "payment_amount": None, "lease_term_months": 24},
+    ]
+    norm = _normalize_extracted_rows(rows)
+    assert len(norm) == 1
+    assert norm[0]["payment_amount"] == 2500.0
+
+
+def test_pdf_fallback_extracts_amount_and_term():
+    from ai.pdf_ingest import _fallback_lease_from_text
+
+    text = "Base rent is $2,500 per month for an initial term of 5 years."
+    fallback = _fallback_lease_from_text(text)
+    assert fallback is not None
+    assert fallback["payment_amount"] == 2500.0
+    assert fallback["lease_term_months"] == 60
