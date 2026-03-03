@@ -112,3 +112,12 @@ def test_pdf_fallback_extracts_amount_and_term():
     assert fallback is not None
     assert fallback["payment_amount"] == 2500.0
     assert fallback["lease_term_months"] == 60
+
+
+def test_pdf_extract_json_from_text_fenced():
+    from ai.pdf_ingest import _extract_json_from_text
+
+    raw = "```json\n{\"leases\":[{\"payment_amount\":2500,\"lease_term_months\":60}]}\n```"
+    rows = _extract_json_from_text(raw)
+    assert len(rows) == 1
+    assert rows[0]["lease_term_months"] == 60

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
+import tempfile
 from datetime import date
 from io import BytesIO
 from typing import Any
@@ -56,12 +56,16 @@ def read_pdf_text(pdf_bytes: bytes) -> str:
 
 
 def _extract_first_amount(text: str) -> float | None:
-    m = re.search(r"\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d{1,2})?)", text)
-    if not m:
-        m = re.search(r"(?:rent|payment)[^\d]{0,20}([0-9]{3,}(?:\.\d{1,2})?)", text, flags=re.I)
-    if not m:
-        return None
-    return float(m.group(1).replace(",", ""))
+    patterns = [
+        r"\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d{1,2})?)",
+        r"(?:rent|payment|monthly|installment)[^\d]{0,30}([0-9]{3,}(?:\.\d{1,2})?)",
+        r"([0-9]{1,3}(?:,[0-9]{3})+\.\d{2})\s*(?:per\s*month|monthly|mo\b)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            return float(m.group(1).replace(",", ""))
+    return None
 
 
 def _extract_term_months(text: str) -> int | None:
@@ -132,6 +136,24 @@ def _normalize_extracted_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]
     return normalized
 
 
+def _extract_json_from_text(raw_text: str) -> list[dict[str, Any]]:
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        text = text.split("\n", 1)[-1]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return []
+    try:
+        payload = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return []
+    if isinstance(payload, dict) and isinstance(payload.get("leases"), list):
+        return payload["leases"]
+    return []
+
+
 def _extract_with_text_prompt(client: OpenAI, text: str, model: str) -> list[dict[str, Any]]:
     prompt = (
         "Extract lease key terms from this lease contract text. "
@@ -160,8 +182,13 @@ def _extract_with_text_prompt(client: OpenAI, text: str, model: str) -> list[dic
     return payload.get("leases", [])
 
 
-def _extract_with_pdf_file(client: OpenAI, pdf_bytes: bytes, model: str, filename: str) -> list[dict[str, Any]]:
-    b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+def _extract_with_pdf_file_upload(client: OpenAI, pdf_bytes: bytes, model: str, filename: str) -> list[dict[str, Any]]:
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
+        tmp.write(pdf_bytes)
+        tmp.flush()
+        with open(tmp.name, "rb") as fh:
+            uploaded = client.files.create(file=fh, purpose="assistants")
+
     response = client.responses.create(
         model=model,
         input=[
@@ -171,14 +198,14 @@ def _extract_with_pdf_file(client: OpenAI, pdf_bytes: bytes, model: str, filenam
                     {
                         "type": "input_text",
                         "text": (
-                            "This is a lease PDF, potentially scanned/image-heavy. "
-                            "OCR the document and extract lease rows with payment_amount and lease_term_months when available."
+                            "OCR and parse this lease PDF. Return a JSON object with key 'leases' containing rows. "
+                            "At minimum, include payment_amount and lease_term_months when found."
                         ),
                     },
                     {
                         "type": "input_file",
+                        "file_id": uploaded.id,
                         "filename": filename,
-                        "file_data": f"data:application/pdf;base64,{b64}",
                     },
                 ],
             }
@@ -194,6 +221,34 @@ def _extract_with_pdf_file(client: OpenAI, pdf_bytes: bytes, model: str, filenam
     )
     payload = json.loads(response.output_text)
     return payload.get("leases", [])
+
+
+def _extract_with_pdf_file_loose_json(client: OpenAI, pdf_bytes: bytes, model: str, filename: str) -> list[dict[str, Any]]:
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
+        tmp.write(pdf_bytes)
+        tmp.flush()
+        with open(tmp.name, "rb") as fh:
+            uploaded = client.files.create(file=fh, purpose="assistants")
+
+    response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Read the lease PDF and return JSON only with format: "
+                            "{'leases':[{'lease_name':..., 'payment_amount':..., 'lease_term_months':..., 'commencement_date':..., 'classification':...}]}"
+                        ),
+                    },
+                    {"type": "input_file", "file_id": uploaded.id, "filename": filename},
+                ],
+            }
+        ],
+    )
+    return _extract_json_from_text(response.output_text)
 
 
 def extract_leases_from_pdf(
@@ -219,15 +274,21 @@ def extract_leases_from_pdf(
     if normalized:
         return normalized
 
-    # If extracted text is sparse or model produced unusable rows, try direct PDF OCR path.
     try:
-        file_candidates = _extract_with_pdf_file(client, pdf_bytes, model, filename)
+        file_candidates = _extract_with_pdf_file_upload(client, pdf_bytes, model, filename)
         normalized = _normalize_extracted_rows(file_candidates)
         if normalized:
             return normalized
     except Exception:
         pass
 
-    # Last deterministic fallback from any extracted text.
+    try:
+        loose_candidates = _extract_with_pdf_file_loose_json(client, pdf_bytes, model, filename)
+        normalized = _normalize_extracted_rows(loose_candidates)
+        if normalized:
+            return normalized
+    except Exception:
+        pass
+
     fallback = _fallback_lease_from_text(text) if text.strip() else None
     return [fallback] if fallback else []

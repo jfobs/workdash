@@ -32,7 +32,7 @@ pytest -q
 ## Input template
 Use the **Download template** button in the app sidebar. Required fields:
 
-You can also upload one or more lease contract PDFs in the sidebar and click **Extract leases from PDFs** (requires `OPENAI_API_KEY`). The extractor now uses a 3-step approach: text extraction + AI parse, then direct PDF OCR/file parsing with AI for scanned docs, then regex fallback for rent/term if needed.
+You can also upload one or more lease contract PDFs in the sidebar and click **Extract leases from PDFs** (requires `OPENAI_API_KEY`). The extractor now uses a 4-step approach: text extraction + AI parse, direct PDF OCR/file parsing with AI, loose-JSON OCR parse fallback, then deterministic regex fallback for rent/term.
 
 For stepped rents / escalations:
 - `escalation_rate_annual` + `escalation_interval_months` (e.g., 0.03 every 12 months), or

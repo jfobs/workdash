@@ -98,7 +98,7 @@ if extract_pdf and pdf_uploads:
         try:
             leases = extract_leases_from_pdf(file.getvalue(), model=ai_model, api_key=openai_api_key or None, filename=file.name)
             if not leases:
-                extraction_errors.append(f"{file.name}: no lease terms detected (try clearer text PDF or different model)")
+                extraction_errors.append(f"{file.name}: no lease terms detected after text+OCR parsing (try gpt-5.2 model or enter core terms manually)")
             extracted_rows.extend(leases)
         except Exception as exc:
             extraction_errors.append(f"{file.name}: {exc}")
