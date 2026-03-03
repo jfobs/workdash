@@ -42,7 +42,11 @@ For stepped rents / escalations:
 - `annual_discount_rate`
 
 ## AI mode
-Set `OPENAI_API_KEY` in your environment (or Streamlit secrets). AI mode is optional.
+AI mode is optional. You can either:
+- set `OPENAI_API_KEY` in your environment (or Streamlit secrets), or
+- enter the key in the left sidebar using **OpenAI API Key**.
+
+You can also choose the model in the sidebar with **OpenAI model**.
 
 ## Project structure
 - `app.py`: Streamlit UI with top tab navigation (Dashboard, Lease Detail, Journal Entries, Disclosures, Import/Export)

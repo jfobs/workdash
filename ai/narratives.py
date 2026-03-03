@@ -6,17 +6,22 @@ import os
 from openai import OpenAI
 
 
-def ai_available() -> bool:
-    return bool(os.getenv("OPENAI_API_KEY"))
+def ai_available(api_key: str | None = None) -> bool:
+    return bool(api_key or os.getenv("OPENAI_API_KEY"))
 
 
-def draft_narrative(context: dict, enabled: bool = True) -> str:
+def draft_narrative(
+    context: dict,
+    enabled: bool = True,
+    model: str = "gpt-5.2",
+    api_key: str | None = None,
+) -> str:
     if not enabled:
         return "AI narrative disabled."
-    if not ai_available():
+    if not ai_available(api_key=api_key):
         return "OPENAI_API_KEY not set; provide manual narrative text."
 
-    client = OpenAI()
+    client = OpenAI(api_key=api_key) if api_key else OpenAI()
     prompt = (
         "Draft concise lease audit workpaper narrative in professional accounting tone. "
         "Do not invent numbers; use only provided context. "
@@ -24,7 +29,7 @@ def draft_narrative(context: dict, enabled: bool = True) -> str:
         + json.dumps(context)
     )
     response = client.responses.create(
-        model="gpt-5.2",
+        model=model,
         input=prompt,
         text={"format": {"type": "json_object"}},
     )

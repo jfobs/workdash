@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
-
 from io import BytesIO
+from typing import Any
 
 from openai import OpenAI
 from pypdf import PdfReader
@@ -52,8 +51,8 @@ EXTRACTION_SCHEMA = {
 }
 
 
-def ai_available() -> bool:
-    return bool(os.getenv("OPENAI_API_KEY"))
+def ai_available(api_key: str | None = None) -> bool:
+    return bool(api_key or os.getenv("OPENAI_API_KEY"))
 
 
 def read_pdf_text(pdf_bytes: bytes) -> str:
@@ -64,8 +63,12 @@ def read_pdf_text(pdf_bytes: bytes) -> str:
     return "\n\n".join(pages)
 
 
-def extract_leases_from_pdf(pdf_bytes: bytes, model: str = "gpt-5.2") -> list[dict[str, Any]]:
-    if not ai_available():
+def extract_leases_from_pdf(
+    pdf_bytes: bytes,
+    model: str = "gpt-5.2",
+    api_key: str | None = None,
+) -> list[dict[str, Any]]:
+    if not ai_available(api_key=api_key):
         raise RuntimeError("OPENAI_API_KEY not set. PDF extraction requires AI.")
 
     text = read_pdf_text(pdf_bytes)
@@ -82,7 +85,7 @@ def extract_leases_from_pdf(pdf_bytes: bytes, model: str = "gpt-5.2") -> list[di
         f"LEASE TEXT:\n{text[:120000]}"
     )
 
-    client = OpenAI()
+    client = OpenAI(api_key=api_key) if api_key else OpenAI()
     response = client.responses.create(
         model=model,
         input=prompt,

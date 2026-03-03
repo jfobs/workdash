@@ -81,7 +81,12 @@ fy_end = st.sidebar.date_input("Fiscal year end", value=date(2024, 12, 31))
 use_comp = st.sidebar.checkbox("Include comparative year", value=False)
 comp_end = st.sidebar.date_input("Comparative year end", value=date(2023, 12, 31), disabled=not use_comp)
 class_filter = st.sidebar.selectbox("Classification filter", ["all", "operating", "finance"])
+
+st.sidebar.header("AI Settings")
 ai_toggle = st.sidebar.toggle("AI narrative", value=False)
+openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password", help="Optional: overrides OPENAI_API_KEY env var for this session.")
+ai_model = st.sidebar.selectbox("OpenAI model", ["gpt-5.2", "gpt-5.2-mini", "gpt-4.1"], index=0)
+
 st.sidebar.download_button("Download template", data=template_bytes(), file_name="lease_template.xlsx")
 
 if uploaded:
@@ -91,7 +96,7 @@ if extract_pdf and pdf_uploads:
     extracted_rows, extraction_errors = [], []
     for file in pdf_uploads:
         try:
-            leases = extract_leases_from_pdf(file.getvalue())
+            leases = extract_leases_from_pdf(file.getvalue(), model=ai_model, api_key=openai_api_key or None)
             if not leases:
                 extraction_errors.append(f"{file.name}: no lease terms detected")
             extracted_rows.extend(leases)
@@ -185,7 +190,7 @@ with io_tab:
     user_narrative = st.text_area("Note narrative text", "Leasing activities are presented below.")
 
     if st.button("Draft narrative with AI"):
-        suggestion = draft_narrative({"fiscal_year": str(fy_end), "lease_count": len(portfolio)}, enabled=ai_toggle)
+        suggestion = draft_narrative({"fiscal_year": str(fy_end), "lease_count": len(portfolio)}, enabled=ai_toggle, model=ai_model, api_key=openai_api_key or None)
         st.write(suggestion)
 
     if st.button("Generate Audit Workbook") and not all_sched.empty:
