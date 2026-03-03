@@ -96,7 +96,7 @@ if extract_pdf and pdf_uploads:
     extracted_rows, extraction_errors = [], []
     for file in pdf_uploads:
         try:
-            leases = extract_leases_from_pdf(file.getvalue(), model=ai_model, api_key=openai_api_key or None)
+            leases = extract_leases_from_pdf(file.getvalue(), model=ai_model, api_key=openai_api_key or None, filename=file.name)
             if not leases:
                 extraction_errors.append(f"{file.name}: no lease terms detected (try clearer text PDF or different model)")
             extracted_rows.extend(leases)

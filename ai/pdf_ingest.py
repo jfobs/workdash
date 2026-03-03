@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -131,29 +132,18 @@ def _normalize_extracted_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]
     return normalized
 
 
-def extract_leases_from_pdf(
-    pdf_bytes: bytes,
-    model: str = "gpt-5.2",
-    api_key: str | None = None,
-) -> list[dict[str, Any]]:
-    if not ai_available(api_key=api_key):
-        raise RuntimeError("OPENAI_API_KEY not set. PDF extraction requires AI.")
-
-    text = read_pdf_text(pdf_bytes)
-    if not text.strip():
-        return []
-
+def _extract_with_text_prompt(client: OpenAI, text: str, model: str) -> list[dict[str, Any]]:
     prompt = (
         "Extract lease key terms from this lease contract text. "
         "Return best-effort structured lease rows even if some fields are uncertain. "
         "Map terms like base rent/monthly rent to payment_amount. "
         "Map initial term (years or months) to lease_term_months. "
         "Map start/commencement date to commencement_date in YYYY-MM-DD. "
+        "If document is equipment/vehicle lease, still extract fixed payment and term. "
         "Use only 'operating' or 'finance' classification.\n\n"
         f"LEASE TEXT:\n{text[:120000]}"
     )
 
-    client = OpenAI(api_key=api_key) if api_key else OpenAI()
     response = client.responses.create(
         model=model,
         input=prompt,
@@ -167,9 +157,77 @@ def extract_leases_from_pdf(
         },
     )
     payload = json.loads(response.output_text)
-    normalized = _normalize_extracted_rows(payload.get("leases", []))
+    return payload.get("leases", [])
+
+
+def _extract_with_pdf_file(client: OpenAI, pdf_bytes: bytes, model: str, filename: str) -> list[dict[str, Any]]:
+    b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+    response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "This is a lease PDF, potentially scanned/image-heavy. "
+                            "OCR the document and extract lease rows with payment_amount and lease_term_months when available."
+                        ),
+                    },
+                    {
+                        "type": "input_file",
+                        "filename": filename,
+                        "file_data": f"data:application/pdf;base64,{b64}",
+                    },
+                ],
+            }
+        ],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "lease_extraction",
+                "schema": EXTRACTION_SCHEMA,
+                "strict": True,
+            }
+        },
+    )
+    payload = json.loads(response.output_text)
+    return payload.get("leases", [])
+
+
+def extract_leases_from_pdf(
+    pdf_bytes: bytes,
+    model: str = "gpt-5.2",
+    api_key: str | None = None,
+    filename: str = "lease.pdf",
+) -> list[dict[str, Any]]:
+    if not ai_available(api_key=api_key):
+        raise RuntimeError("OPENAI_API_KEY not set. PDF extraction requires AI.")
+
+    client = OpenAI(api_key=api_key) if api_key else OpenAI()
+    text = read_pdf_text(pdf_bytes)
+
+    candidates: list[dict[str, Any]] = []
+    if text.strip():
+        try:
+            candidates = _extract_with_text_prompt(client, text, model)
+        except Exception:
+            candidates = []
+
+    normalized = _normalize_extracted_rows(candidates)
     if normalized:
         return normalized
 
-    fallback = _fallback_lease_from_text(text)
+    # If extracted text is sparse or model produced unusable rows, try direct PDF OCR path.
+    try:
+        file_candidates = _extract_with_pdf_file(client, pdf_bytes, model, filename)
+        normalized = _normalize_extracted_rows(file_candidates)
+        if normalized:
+            return normalized
+    except Exception:
+        pass
+
+    # Last deterministic fallback from any extracted text.
+    fallback = _fallback_lease_from_text(text) if text.strip() else None
     return [fallback] if fallback else []
