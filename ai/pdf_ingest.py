@@ -55,10 +55,23 @@ def read_pdf_text(pdf_bytes: bytes) -> str:
     return "\n\n".join(pages)
 
 
+def _response_text(response: Any) -> str:
+    text = getattr(response, "output_text", "") or ""
+    if text.strip():
+        return text
+    chunks: list[str] = []
+    for item in getattr(response, "output", []) or []:
+        for c in getattr(item, "content", []) or []:
+            t = getattr(c, "text", None)
+            if t:
+                chunks.append(t)
+    return "\n".join(chunks)
+
+
 def _extract_first_amount(text: str) -> float | None:
     patterns = [
         r"\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d{1,2})?)",
-        r"(?:rent|payment|monthly|installment)[^\d]{0,30}([0-9]{3,}(?:\.\d{1,2})?)",
+        r"(?:rent|payment|monthly|installment|base\s+rent)[^\d]{0,40}([0-9]{3,}(?:\.\d{1,2})?)",
         r"([0-9]{1,3}(?:,[0-9]{3})+\.\d{2})\s*(?:per\s*month|monthly|mo\b)",
     ]
     for pat in patterns:
@@ -78,6 +91,14 @@ def _extract_term_months(text: str) -> int | None:
     return None
 
 
+def _extract_date(text: str) -> str | None:
+    m = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", text)
+    if not m:
+        return None
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return f"{y:04d}-{mo:02d}-{d:02d}"
+
+
 def _fallback_lease_from_text(text: str) -> dict[str, Any] | None:
     amount = _extract_first_amount(text)
     term = _extract_term_months(text)
@@ -87,7 +108,7 @@ def _fallback_lease_from_text(text: str) -> dict[str, Any] | None:
         "lease_id": "LEASE-1",
         "lease_name": "Extracted Lease",
         "classification": "operating",
-        "commencement_date": date.today().isoformat(),
+        "commencement_date": _extract_date(text) or date.today().isoformat(),
         "payment_frequency": "monthly",
         "payment_amount": amount,
         "payment_timing": "EOM",
@@ -154,6 +175,15 @@ def _extract_json_from_text(raw_text: str) -> list[dict[str, Any]]:
     return []
 
 
+def _upload_pdf(client: OpenAI, pdf_bytes: bytes) -> str:
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
+        tmp.write(pdf_bytes)
+        tmp.flush()
+        with open(tmp.name, "rb") as fh:
+            uploaded = client.files.create(file=fh, purpose="assistants")
+    return uploaded.id
+
+
 def _extract_with_text_prompt(client: OpenAI, text: str, model: str) -> list[dict[str, Any]]:
     prompt = (
         "Extract lease key terms from this lease contract text. "
@@ -178,17 +208,11 @@ def _extract_with_text_prompt(client: OpenAI, text: str, model: str) -> list[dic
             }
         },
     )
-    payload = json.loads(response.output_text)
+    payload = json.loads(_response_text(response) or "{}")
     return payload.get("leases", [])
 
 
-def _extract_with_pdf_file_upload(client: OpenAI, pdf_bytes: bytes, model: str, filename: str) -> list[dict[str, Any]]:
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
-        tmp.write(pdf_bytes)
-        tmp.flush()
-        with open(tmp.name, "rb") as fh:
-            uploaded = client.files.create(file=fh, purpose="assistants")
-
+def _extract_with_pdf_file_upload(client: OpenAI, file_id: str, model: str, filename: str) -> list[dict[str, Any]]:
     response = client.responses.create(
         model=model,
         input=[
@@ -198,15 +222,11 @@ def _extract_with_pdf_file_upload(client: OpenAI, pdf_bytes: bytes, model: str, 
                     {
                         "type": "input_text",
                         "text": (
-                            "OCR and parse this lease PDF. Return a JSON object with key 'leases' containing rows. "
-                            "At minimum, include payment_amount and lease_term_months when found."
+                            "OCR and parse this lease PDF. Return JSON object with key 'leases'. "
+                            "At minimum include payment_amount and lease_term_months if found."
                         ),
                     },
-                    {
-                        "type": "input_file",
-                        "file_id": uploaded.id,
-                        "filename": filename,
-                    },
+                    {"type": "input_file", "file_id": file_id, "filename": filename},
                 ],
             }
         ],
@@ -219,17 +239,11 @@ def _extract_with_pdf_file_upload(client: OpenAI, pdf_bytes: bytes, model: str, 
             }
         },
     )
-    payload = json.loads(response.output_text)
+    payload = json.loads(_response_text(response) or "{}")
     return payload.get("leases", [])
 
 
-def _extract_with_pdf_file_loose_json(client: OpenAI, pdf_bytes: bytes, model: str, filename: str) -> list[dict[str, Any]]:
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
-        tmp.write(pdf_bytes)
-        tmp.flush()
-        with open(tmp.name, "rb") as fh:
-            uploaded = client.files.create(file=fh, purpose="assistants")
-
+def _extract_with_pdf_file_loose_json(client: OpenAI, file_id: str, model: str, filename: str) -> list[dict[str, Any]]:
     response = client.responses.create(
         model=model,
         input=[
@@ -239,16 +253,38 @@ def _extract_with_pdf_file_loose_json(client: OpenAI, pdf_bytes: bytes, model: s
                     {
                         "type": "input_text",
                         "text": (
-                            "Read the lease PDF and return JSON only with format: "
+                            "Read this lease PDF and return JSON only: "
                             "{'leases':[{'lease_name':..., 'payment_amount':..., 'lease_term_months':..., 'commencement_date':..., 'classification':...}]}"
                         ),
                     },
-                    {"type": "input_file", "file_id": uploaded.id, "filename": filename},
+                    {"type": "input_file", "file_id": file_id, "filename": filename},
                 ],
             }
         ],
     )
-    return _extract_json_from_text(response.output_text)
+    return _extract_json_from_text(_response_text(response))
+
+
+def _ocr_transcribe_pdf(client: OpenAI, file_id: str, model: str, filename: str) -> str:
+    response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Transcribe key commercial lease economics from this PDF into plain English. "
+                            "Include payment amount, term, start date, frequency, and classification clues."
+                        ),
+                    },
+                    {"type": "input_file", "file_id": file_id, "filename": filename},
+                ],
+            }
+        ],
+    )
+    return _response_text(response)
 
 
 def extract_leases_from_pdf(
@@ -263,32 +299,41 @@ def extract_leases_from_pdf(
     client = OpenAI(api_key=api_key) if api_key else OpenAI()
     text = read_pdf_text(pdf_bytes)
 
-    candidates: list[dict[str, Any]] = []
     if text.strip():
         try:
-            candidates = _extract_with_text_prompt(client, text, model)
+            normalized = _normalize_extracted_rows(_extract_with_text_prompt(client, text, model))
+            if normalized:
+                return normalized
         except Exception:
-            candidates = []
-
-    normalized = _normalize_extracted_rows(candidates)
-    if normalized:
-        return normalized
+            pass
 
     try:
-        file_candidates = _extract_with_pdf_file_upload(client, pdf_bytes, model, filename)
-        normalized = _normalize_extracted_rows(file_candidates)
-        if normalized:
-            return normalized
+        file_id = _upload_pdf(client, pdf_bytes)
     except Exception:
-        pass
+        file_id = ""
 
-    try:
-        loose_candidates = _extract_with_pdf_file_loose_json(client, pdf_bytes, model, filename)
-        normalized = _normalize_extracted_rows(loose_candidates)
-        if normalized:
-            return normalized
-    except Exception:
-        pass
+    if file_id:
+        try:
+            normalized = _normalize_extracted_rows(_extract_with_pdf_file_upload(client, file_id, model, filename))
+            if normalized:
+                return normalized
+        except Exception:
+            pass
+
+        try:
+            normalized = _normalize_extracted_rows(_extract_with_pdf_file_loose_json(client, file_id, model, filename))
+            if normalized:
+                return normalized
+        except Exception:
+            pass
+
+        try:
+            ocr_text = _ocr_transcribe_pdf(client, file_id, model, filename)
+            fallback = _fallback_lease_from_text(ocr_text)
+            if fallback:
+                return [fallback]
+        except Exception:
+            pass
 
     fallback = _fallback_lease_from_text(text) if text.strip() else None
     return [fallback] if fallback else []
