@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "workdash"
+version = "0.1.0"
+description = "Financial statement review Streamlit app"
+requires-python = ">=3.12"
+dependencies = [
+  "streamlit>=1.42",
+  "pandas>=2.2",
+  "PyMuPDF>=1.24",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+addopts = "-q"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+]
+
+[tool.poetry]
+package-mode = false
