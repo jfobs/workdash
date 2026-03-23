@@ -102,7 +102,19 @@ with right:
 
     st.subheader("Drag-box Calculator")
     if all_facts:
-        px0, py0, px1, py1 = st.slider("Selection bbox", 0, 1000, (0, 0, 500, 500))
+        st.caption("Set drag-box bounds in page-space coordinates.")
+        c1, c2 = st.columns(2)
+        with c1:
+            px0 = st.number_input("x0", min_value=0, max_value=1000, value=0, step=1)
+            py0 = st.number_input("y0", min_value=0, max_value=1000, value=0, step=1)
+        with c2:
+            px1 = st.number_input("x1", min_value=0, max_value=1000, value=500, step=1)
+            py1 = st.number_input("y1", min_value=0, max_value=1000, value=500, step=1)
+
+        if px1 < px0 or py1 < py0:
+            st.error("Invalid bbox: x1/y1 must be greater than or equal to x0/y0.")
+            st.stop()
+
         bbox = (float(px0), float(py0), float(px1), float(py1))
         selected_facts = intersecting_facts(all_facts, bbox)
         signs = [1 for _ in selected_facts]
