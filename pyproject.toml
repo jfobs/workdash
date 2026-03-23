@@ -21,3 +21,6 @@ addopts = "-q"
 dev = [
   "pytest>=8.3",
 ]
+
+[tool.poetry]
+package-mode = false
