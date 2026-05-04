@@ -1,7 +1,8 @@
 """FinStatement AI — Streamlit entry point.
 
 Handles:
-- API key gate (validated via a lightweight Claude call)
+- Provider + API key gate (Anthropic Claude or OpenAI GPT, validated via a
+  lightweight call)
 - Session-state initialization
 - Sidebar navigation and Reset Session control
 """
@@ -10,7 +11,11 @@ from __future__ import annotations
 
 import streamlit as st
 
-from utils.ai_engine import validate_api_key
+from utils.ai_engine import (
+    PROVIDER_ANTHROPIC,
+    PROVIDER_OPENAI,
+    validate_api_key,
+)
 
 
 st.set_page_config(
@@ -21,8 +26,19 @@ st.set_page_config(
 )
 
 
+PROVIDER_LABELS = {
+    PROVIDER_ANTHROPIC: "Anthropic (Claude)",
+    PROVIDER_OPENAI: "OpenAI (GPT)",
+}
+PROVIDER_HELP = {
+    PROVIDER_ANTHROPIC: "Get a key at https://console.anthropic.com",
+    PROVIDER_OPENAI: "Get a key at https://platform.openai.com/api-keys",
+}
+
+
 def init_session_state() -> None:
     defaults = {
+        "provider": PROVIDER_ANTHROPIC,
         "api_key": "",
         "api_key_validated": False,
         "entity_type": "For-Profit",
@@ -33,12 +49,12 @@ def init_session_state() -> None:
         "cash_flow_method": "Indirect",
         "uploaded_source_type": "",
         "raw_uploaded_filename": "",
-        "parsed_tb": None,            # standardized DataFrame
-        "py_notes_text": "",          # text blob from prior year notes (if uploaded)
-        "statements": {},             # dict: statement_name -> list of rows
-        "checklist": [],              # list of checklist items
-        "notes": [],                  # list of note dicts
-        "facts": {                    # flags driving the checklist engine
+        "parsed_tb": None,
+        "py_notes_text": "",
+        "statements": {},
+        "checklist": [],
+        "notes": [],
+        "facts": {
             "has_leases": False,
             "has_income_taxes": False,
             "has_stock_comp": False,
@@ -58,25 +74,35 @@ def reset_session() -> None:
 
 
 def render_api_key_gate() -> bool:
-    """Sidebar API key entry. Returns True once the key is validated."""
-    st.sidebar.header("Anthropic API key")
+    """Sidebar provider + API key entry. Returns True once the key is validated."""
+    st.sidebar.header("LLM provider")
+
     if st.session_state.api_key_validated:
-        st.sidebar.success("API key validated")
-        if st.sidebar.button("Change API key"):
+        provider_label = PROVIDER_LABELS.get(st.session_state.provider, st.session_state.provider)
+        st.sidebar.success(f"{provider_label} validated")
+        if st.sidebar.button("Change provider / API key"):
             st.session_state.api_key = ""
             st.session_state.api_key_validated = False
             st.rerun()
         return True
 
+    provider_choice = st.sidebar.radio(
+        "Choose a provider",
+        [PROVIDER_ANTHROPIC, PROVIDER_OPENAI],
+        format_func=lambda p: PROVIDER_LABELS[p],
+        index=[PROVIDER_ANTHROPIC, PROVIDER_OPENAI].index(st.session_state.provider),
+    )
+    st.session_state.provider = provider_choice
+
     key_input = st.sidebar.text_input(
-        "Enter your Anthropic API key",
+        f"Enter your {PROVIDER_LABELS[provider_choice]} API key",
         type="password",
         value=st.session_state.api_key,
-        help="Get a key at https://console.anthropic.com. The key is held in session state and never written to disk.",
+        help=PROVIDER_HELP[provider_choice] + ". The key is held in session state and never written to disk.",
     )
     if st.sidebar.button("Validate key", type="primary", disabled=not key_input):
-        with st.spinner("Validating API key..."):
-            ok, msg = validate_api_key(key_input)
+        with st.spinner(f"Validating {PROVIDER_LABELS[provider_choice]} API key..."):
+            ok, msg = validate_api_key(provider_choice, key_input)
         if ok:
             st.session_state.api_key = key_input.strip()
             st.session_state.api_key_validated = True
@@ -93,6 +119,7 @@ def render_sidebar_controls() -> None:
     if st.sidebar.button("Reset Session", help="Clear all uploaded data, statements, and notes."):
         reset_session()
         st.rerun()
+    st.sidebar.caption(f"Provider: {PROVIDER_LABELS.get(st.session_state.provider, st.session_state.provider)}")
     st.sidebar.caption(f"Entity: {st.session_state.entity_name or '(not set)'}")
     st.sidebar.caption(f"Type: {st.session_state.entity_type}")
 
@@ -105,7 +132,7 @@ def main() -> None:
 
     if not render_api_key_gate():
         st.info(
-            "Enter your Anthropic API key in the sidebar to begin. "
+            "Choose a provider (Anthropic Claude or OpenAI GPT) and enter your API key in the sidebar to begin. "
             "Once validated, use the navigation in the left sidebar to move through Upload → Statements → Notes → Export."
         )
         st.stop()

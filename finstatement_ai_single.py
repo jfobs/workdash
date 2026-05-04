@@ -7,6 +7,7 @@ replaces the pages/ folder navigation.
 Requirements (paste into requirements.txt or install locally):
     streamlit==1.40.1
     anthropic==0.40.0
+    openai==1.57.0
     pandas==2.2.3
     openpyxl==3.1.5
     reportlab==4.2.5
@@ -24,6 +25,7 @@ from datetime import date
 from typing import Callable, Optional
 
 import anthropic
+import openai
 import pandas as pd
 import streamlit as st
 from reportlab.lib import colors
@@ -40,7 +42,21 @@ from reportlab.platypus import (
 # CONSTANTS / TEMPLATES (from utils/mappings.py)
 # =============================================================================
 
-DEFAULT_MODEL = "claude-sonnet-4-5"
+PROVIDER_ANTHROPIC = "anthropic"
+PROVIDER_OPENAI = "openai"
+SUPPORTED_PROVIDERS = (PROVIDER_ANTHROPIC, PROVIDER_OPENAI)
+
+DEFAULT_MODEL_ANTHROPIC = "claude-sonnet-4-5"
+DEFAULT_MODEL_OPENAI = "gpt-4o"
+
+PROVIDER_LABELS = {
+    PROVIDER_ANTHROPIC: "Anthropic (Claude)",
+    PROVIDER_OPENAI: "OpenAI (GPT)",
+}
+PROVIDER_HELP = {
+    PROVIDER_ANTHROPIC: "Get a key at https://console.anthropic.com",
+    PROVIDER_OPENAI: "Get a key at https://platform.openai.com/api-keys",
+}
 
 STATEMENT_BALANCE_SHEET = "Balance Sheet"
 STATEMENT_INCOME = "Income Statement"
@@ -451,7 +467,7 @@ def aggregate_by_line_item(df):
 
 
 # =============================================================================
-# AI ENGINE (from utils/ai_engine.py)
+# AI ENGINE (dual-provider: Anthropic + OpenAI)
 # =============================================================================
 
 SYSTEM_NOTE_DRAFTER = """You are an expert CPA and technical accounting writer drafting GAAP-compliant \
@@ -469,16 +485,41 @@ insert a placeholder in the form [CONFIRM: <what to confirm>].
 """
 
 
-def _client(api_key):
-    return anthropic.Anthropic(api_key=api_key)
-
-
-def _extract_text(response):
+def _call_anthropic(api_key, system, user_prompt, max_tokens, model_override=None):
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model=model_override or DEFAULT_MODEL_ANTHROPIC,
+        max_tokens=max_tokens,
+        system=system,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
     parts = []
     for block in response.content:
         if getattr(block, "type", None) == "text":
             parts.append(block.text)
     return "".join(parts)
+
+
+def _call_openai(api_key, system, user_prompt, max_tokens, want_json=False, model_override=None):
+    client = openai.OpenAI(api_key=api_key)
+    kwargs = {
+        "model": model_override or DEFAULT_MODEL_OPENAI,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    if want_json:
+        kwargs["response_format"] = {"type": "json_object"}
+    response = client.chat.completions.create(**kwargs)
+    return response.choices[0].message.content or ""
+
+
+def _call_llm(provider, api_key, system, user_prompt, max_tokens, want_json=False, model_override=None):
+    if provider == PROVIDER_OPENAI:
+        return _call_openai(api_key, system, user_prompt, max_tokens, want_json, model_override)
+    return _call_anthropic(api_key, system, user_prompt, max_tokens, model_override)
 
 
 def _first_json_blob(text):
@@ -517,30 +558,46 @@ def _extract_json(text):
     return None
 
 
-def validate_api_key(api_key):
+def validate_api_key(provider, api_key):
+    if provider not in SUPPORTED_PROVIDERS:
+        return False, f"Unsupported provider: {provider}"
     if not api_key or not api_key.strip():
         return False, "API key is empty."
     try:
-        client = _client(api_key.strip())
-        client.messages.create(
-            model=DEFAULT_MODEL,
-            max_tokens=8,
-            messages=[{"role": "user", "content": "ping"}],
-        )
+        if provider == PROVIDER_OPENAI:
+            client = openai.OpenAI(api_key=api_key.strip())
+            client.chat.completions.create(
+                model=DEFAULT_MODEL_OPENAI, max_tokens=8,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+        else:
+            client = anthropic.Anthropic(api_key=api_key.strip())
+            client.messages.create(
+                model=DEFAULT_MODEL_ANTHROPIC, max_tokens=8,
+                messages=[{"role": "user", "content": "ping"}],
+            )
         return True, "API key validated."
     except anthropic.AuthenticationError:
-        return False, "Invalid API key."
+        return False, "Invalid Anthropic API key."
     except anthropic.PermissionDeniedError:
-        return False, "API key lacks permission."
+        return False, "Anthropic API key lacks permission."
     except anthropic.RateLimitError:
         return False, "Rate limited; the key looks valid. Try again in a moment."
     except anthropic.APIConnectionError:
-        return False, "Could not reach the Anthropic API. Check your network."
+        return False, "Could not reach the Anthropic API."
+    except openai.AuthenticationError:
+        return False, "Invalid OpenAI API key."
+    except openai.PermissionDeniedError:
+        return False, "OpenAI API key lacks permission."
+    except openai.RateLimitError:
+        return False, "Rate limited; the key looks valid. Try again in a moment."
+    except openai.APIConnectionError:
+        return False, "Could not reach the OpenAI API."
     except Exception as e:
         return False, f"Unexpected error: {e}"
 
 
-def suggest_account_mapping(api_key, accounts_df, entity_type):
+def suggest_account_mapping(provider, api_key, accounts_df, entity_type):
     if accounts_df is None or accounts_df.empty:
         return accounts_df
     rows = [{
@@ -557,20 +614,20 @@ For each account, return:
 - group: e.g. "Assets", "Liabilities", "Equity", "Revenue", "Operating Expenses"
 - line_item: a standard GAAP caption
 
-Return ONLY a JSON array. Each element MUST have keys: account_number, \
-account_description, statement, group, line_item.
+Return ONLY a JSON object with key "accounts" mapping to an array. Each array \
+element MUST have keys: account_number, account_description, statement, group, line_item.
 
 Accounts to classify:
 {json.dumps(rows, indent=2)}
 """
-    client = _client(api_key)
-    response = client.messages.create(
-        model=DEFAULT_MODEL,
-        max_tokens=8000,
+    text = _call_llm(
+        provider=provider, api_key=api_key,
         system="You are an expert CPA classifying chart-of-accounts entries to GAAP financial statement line items. Return strict JSON only.",
-        messages=[{"role": "user", "content": user_prompt}],
+        user_prompt=user_prompt, max_tokens=8000, want_json=True,
     )
-    parsed = _extract_json(_extract_text(response))
+    parsed = _extract_json(text)
+    if isinstance(parsed, dict) and "accounts" in parsed:
+        parsed = parsed["accounts"]
     if not isinstance(parsed, list):
         return accounts_df
     by_key = {}
@@ -591,7 +648,7 @@ Accounts to classify:
     return out
 
 
-def generate_all_notes(api_key, entity_name, entity_type, fiscal_year_end,
+def generate_all_notes(provider, api_key, entity_name, entity_type, fiscal_year_end,
                        statements_summary, required_notes, prior_year_notes_text=""):
     pyn = ""
     if prior_year_notes_text:
@@ -608,7 +665,8 @@ Financial statement summary:
 Required notes (in order):
 {json.dumps(required_notes, indent=2)}
 {pyn}
-Return ONLY a JSON array. Each element MUST have keys:
+Return ONLY a JSON object with key "notes" mapping to an array. Each array \
+element MUST have keys:
 - title (e.g., "Note 1 - Summary of Significant Accounting Policies")
 - narrative (formal disclosure prose; use real dollar figures; use [CONFIRM: ...] placeholders)
 - table_data (array of row objects; [] if no table)
@@ -617,13 +675,16 @@ Return ONLY a JSON array. Each element MUST have keys:
 For notes with a schedule (debt, lease maturity, PP&E, net asset rollforward, etc.), \
 populate table_data and table_columns. Note 1 is always Summary of Significant Accounting Policies.
 """
-    system = SYSTEM_NOTE_DRAFTER.format(entity_type=entity_type)
-    client = _client(api_key)
-    response = client.messages.create(
-        model=DEFAULT_MODEL, max_tokens=16000, system=system,
-        messages=[{"role": "user", "content": user_prompt}],
+    text = _call_llm(
+        provider=provider, api_key=api_key,
+        system=SYSTEM_NOTE_DRAFTER.format(entity_type=entity_type),
+        user_prompt=user_prompt,
+        max_tokens=16000 if provider == PROVIDER_ANTHROPIC else 8000,
+        want_json=True,
     )
-    parsed = _extract_json(_extract_text(response))
+    parsed = _extract_json(text)
+    if isinstance(parsed, dict) and "notes" in parsed:
+        parsed = parsed["notes"]
     if not isinstance(parsed, list):
         return []
     cleaned = []
@@ -639,7 +700,7 @@ populate table_data and table_columns. Note 1 is always Summary of Significant A
     return cleaned
 
 
-def regenerate_note(api_key, entity_name, entity_type, note_title,
+def regenerate_note(provider, api_key, entity_name, entity_type, note_title,
                     statements_summary, instruction="", mode="redo", existing_narrative=""):
     if mode == "redo":
         directive = "Generate this note from scratch, taking a different approach than before."
@@ -662,13 +723,11 @@ Instruction:
 
 Return ONLY a JSON object with keys: title, narrative, table_data, table_columns.
 """
-    client = _client(api_key)
-    response = client.messages.create(
-        model=DEFAULT_MODEL, max_tokens=6000,
+    text = _call_llm(
+        provider=provider, api_key=api_key,
         system=SYSTEM_NOTE_DRAFTER.format(entity_type=entity_type),
-        messages=[{"role": "user", "content": user_prompt}],
+        user_prompt=user_prompt, max_tokens=6000, want_json=True,
     )
-    text = _extract_text(response)
     parsed = _extract_json(text)
     if not isinstance(parsed, dict):
         return {"title": note_title, "narrative": text.strip(), "table_data": [], "table_columns": []}
@@ -680,7 +739,7 @@ Return ONLY a JSON object with keys: title, narrative, table_data, table_columns
     }
 
 
-def generate_single_note(api_key, entity_name, entity_type, note_topic, statements_summary):
+def generate_single_note(provider, api_key, entity_name, entity_type, note_topic, statements_summary):
     user_prompt = f"""Draft a single GAAP-compliant note for the topic below.
 
 Entity: {entity_name}
@@ -692,13 +751,11 @@ Financial statement summary:
 
 Return ONLY a JSON object with keys: title, narrative, table_data, table_columns.
 """
-    client = _client(api_key)
-    response = client.messages.create(
-        model=DEFAULT_MODEL, max_tokens=4000,
+    text = _call_llm(
+        provider=provider, api_key=api_key,
         system=SYSTEM_NOTE_DRAFTER.format(entity_type=entity_type),
-        messages=[{"role": "user", "content": user_prompt}],
+        user_prompt=user_prompt, max_tokens=4000, want_json=True,
     )
-    text = _extract_text(response)
     parsed = _extract_json(text)
     if not isinstance(parsed, dict):
         return {"title": note_topic, "narrative": text.strip(), "table_data": [], "table_columns": []}
@@ -1089,6 +1146,7 @@ st.set_page_config(page_title="FinStatement AI", page_icon="📊", layout="wide"
 
 def init_session_state():
     defaults = {
+        "provider": PROVIDER_ANTHROPIC,
         "api_key": "", "api_key_validated": False,
         "entity_type": ENTITY_FOR_PROFIT, "basis": "Accrual",
         "entity_name": "", "fiscal_year_end": None,
@@ -1266,10 +1324,11 @@ def page_upload():
             st.session_state.raw_uploaded_filename = uploaded.name
 
             if not has_grouping(df) and st.session_state.uploaded_source_type == "trial_balance":
-                st.info("No grouping column detected — asking Claude to suggest mappings.")
+                st.info("No grouping column detected — asking the LLM to suggest mappings.")
                 try:
-                    with st.spinner("Generating account mappings (Claude)..."):
+                    with st.spinner("Generating account mappings..."):
                         df = suggest_account_mapping(
+                            provider=st.session_state.provider,
                             api_key=st.session_state.api_key,
                             accounts_df=df, entity_type=st.session_state.entity_type,
                         )
@@ -1511,6 +1570,7 @@ def regen_note(idx, mode, instruction=""):
     with st.spinner("Regenerating note..."):
         try:
             updated = regenerate_note(
+                provider=st.session_state.provider,
                 api_key=st.session_state.api_key,
                 entity_name=st.session_state.entity_name or "the Entity",
                 entity_type=st.session_state.entity_type,
@@ -1582,7 +1642,7 @@ def page_notes():
     with left:
         if not st.session_state.notes:
             st.info("No notes drafted yet. Click below to generate the initial draft.")
-            if st.button("Generate initial notes (Claude)", type="primary"):
+            if st.button("Generate initial notes", type="primary"):
                 titles = required_note_titles(st.session_state.checklist) or [
                     "Summary of Significant Accounting Policies",
                     "Nature of Operations", "Subsequent Events",
@@ -1590,6 +1650,7 @@ def page_notes():
                 with st.spinner("Drafting notes — this may take a moment..."):
                     try:
                         notes = generate_all_notes(
+                            provider=st.session_state.provider,
                             api_key=st.session_state.api_key,
                             entity_name=st.session_state.entity_name or "the Entity",
                             entity_type=st.session_state.entity_type,
@@ -1602,7 +1663,7 @@ def page_notes():
                         st.error(f"Note generation failed: {e}")
                         return
                 if not notes:
-                    st.error("Claude did not return any notes. Try again or adjust the checklist.")
+                    st.error("The LLM did not return any notes. Try again or adjust the checklist.")
                     return
                 sigacct_idx = next((i for i, n in enumerate(notes) if "significant accounting" in n.get("title", "").lower()), None)
                 if sigacct_idx is None:
@@ -1636,6 +1697,7 @@ def page_notes():
                 with st.spinner("Generating note..."):
                     try:
                         new_note = generate_single_note(
+                            provider=st.session_state.provider,
                             api_key=st.session_state.api_key,
                             entity_name=st.session_state.entity_name or "the Entity",
                             entity_type=st.session_state.entity_type,
@@ -1772,22 +1834,32 @@ Use **Reset Session** in the sidebar to clear all data and start over.
 
 
 def render_api_key_gate():
-    st.sidebar.header("Anthropic API key")
+    st.sidebar.header("LLM provider")
     if st.session_state.api_key_validated:
-        st.sidebar.success("API key validated")
-        if st.sidebar.button("Change API key"):
+        provider_label = PROVIDER_LABELS.get(st.session_state.provider, st.session_state.provider)
+        st.sidebar.success(f"{provider_label} validated")
+        if st.sidebar.button("Change provider / API key"):
             st.session_state.api_key = ""
             st.session_state.api_key_validated = False
             st.rerun()
         return True
 
+    provider_choice = st.sidebar.radio(
+        "Choose a provider",
+        [PROVIDER_ANTHROPIC, PROVIDER_OPENAI],
+        format_func=lambda p: PROVIDER_LABELS[p],
+        index=[PROVIDER_ANTHROPIC, PROVIDER_OPENAI].index(st.session_state.provider),
+    )
+    st.session_state.provider = provider_choice
+
     key_input = st.sidebar.text_input(
-        "Enter your Anthropic API key", type="password", value=st.session_state.api_key,
-        help="Get a key at https://console.anthropic.com. The key is held in session state and never written to disk.",
+        f"Enter your {PROVIDER_LABELS[provider_choice]} API key",
+        type="password", value=st.session_state.api_key,
+        help=PROVIDER_HELP[provider_choice] + ". The key is held in session state and never written to disk.",
     )
     if st.sidebar.button("Validate key", type="primary", disabled=not key_input):
-        with st.spinner("Validating API key..."):
-            ok, msg = validate_api_key(key_input)
+        with st.spinner(f"Validating {PROVIDER_LABELS[provider_choice]} API key..."):
+            ok, msg = validate_api_key(provider_choice, key_input)
         if ok:
             st.session_state.api_key = key_input.strip()
             st.session_state.api_key_validated = True
@@ -1813,6 +1885,7 @@ def render_sidebar_nav():
     if st.sidebar.button("Reset Session"):
         reset_session()
         st.rerun()
+    st.sidebar.caption(f"Provider: {PROVIDER_LABELS.get(st.session_state.provider, st.session_state.provider)}")
     st.sidebar.caption(f"Entity: {st.session_state.entity_name or '(not set)'}")
     st.sidebar.caption(f"Type: {st.session_state.entity_type}")
     return selected

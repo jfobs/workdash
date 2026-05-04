@@ -160,10 +160,11 @@ def render_upload() -> None:
     st.session_state.raw_uploaded_filename = uploaded.name
 
     if not parser.has_grouping(df) and st.session_state.uploaded_source_type == "trial_balance":
-        st.info("No grouping/classification column detected — asking Claude to suggest GAAP line-item mappings.")
+        st.info("No grouping/classification column detected — asking the LLM to suggest GAAP line-item mappings.")
         try:
-            with st.spinner("Generating account mappings (Claude)..."):
+            with st.spinner("Generating account mappings..."):
                 df = suggest_account_mapping(
+                    provider=st.session_state.provider,
                     api_key=st.session_state.api_key,
                     accounts_df=df,
                     entity_type=st.session_state.entity_type,

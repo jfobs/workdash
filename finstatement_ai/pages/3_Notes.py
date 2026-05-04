@@ -92,7 +92,7 @@ def _generate_initial_notes_button():
     if st.session_state.notes:
         return
     st.info("No notes drafted yet. Click the button below to generate the initial draft for all triggered disclosures.")
-    if st.button("Generate initial notes (Claude)", type="primary"):
+    if st.button("Generate initial notes", type="primary"):
         titles = required_note_titles(st.session_state.checklist) or [
             "Summary of Significant Accounting Policies",
             "Nature of Operations",
@@ -101,6 +101,7 @@ def _generate_initial_notes_button():
         with st.spinner("Drafting notes — this may take a moment..."):
             try:
                 notes = generate_all_notes(
+                    provider=st.session_state.provider,
                     api_key=st.session_state.api_key,
                     entity_name=st.session_state.entity_name or "the Entity",
                     entity_type=st.session_state.entity_type,
@@ -113,7 +114,7 @@ def _generate_initial_notes_button():
                 st.error(f"Note generation failed: {e}")
                 return
         if not notes:
-            st.error("Claude did not return any notes. Try again or adjust the checklist.")
+            st.error("The LLM did not return any notes. Try again or adjust the checklist.")
             return
         # Ensure Note 1 is always Summary of Significant Accounting Policies.
         # If the model returned it, move it to the front; otherwise prepend.
@@ -204,6 +205,7 @@ def _regen_note(idx: int, mode: str, instruction: str = "") -> None:
     with st.spinner("Regenerating note..."):
         try:
             updated = regenerate_note(
+                provider=st.session_state.provider,
                 api_key=st.session_state.api_key,
                 entity_name=st.session_state.entity_name or "the Entity",
                 entity_type=st.session_state.entity_type,
@@ -239,6 +241,7 @@ def _add_note_section():
             with st.spinner("Generating note..."):
                 try:
                     note = generate_single_note(
+                        provider=st.session_state.provider,
                         api_key=st.session_state.api_key,
                         entity_name=st.session_state.entity_name or "the Entity",
                         entity_type=st.session_state.entity_type,

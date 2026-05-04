@@ -1,7 +1,8 @@
-"""Centralized Claude API wrappers for FinStatement AI.
+"""Centralized LLM API wrappers for FinStatement AI.
 
-All Claude calls live here. Pages call high-level helpers; this module
-handles prompt construction, JSON parsing, and error surfacing.
+Supports both Anthropic (Claude) and OpenAI as drop-in providers. The
+high-level note/mapping functions take a `provider` argument; the
+private `_call_llm` helper dispatches to the right SDK.
 """
 
 from __future__ import annotations
@@ -11,13 +12,17 @@ import re
 from typing import Optional
 
 import anthropic
+import openai
 import pandas as pd
 
 
-# Active Sonnet alias. The original spec named claude-sonnet-4-20250514, which
-# is the deprecated Sonnet 4.0 release; claude-sonnet-4-5 is its drop-in
-# replacement and remains active. Bump to claude-sonnet-4-6 when ready.
-DEFAULT_MODEL = "claude-sonnet-4-5"
+PROVIDER_ANTHROPIC = "anthropic"
+PROVIDER_OPENAI = "openai"
+SUPPORTED_PROVIDERS = (PROVIDER_ANTHROPIC, PROVIDER_OPENAI)
+
+# Active aliases. Override in session state if desired.
+DEFAULT_MODEL_ANTHROPIC = "claude-sonnet-4-5"
+DEFAULT_MODEL_OPENAI = "gpt-4o"
 
 
 SYSTEM_NOTE_DRAFTER = """You are an expert CPA and technical accounting writer drafting GAAP-compliant \
@@ -38,11 +43,33 @@ the data.
 """
 
 
-def _client(api_key: str) -> anthropic.Anthropic:
-    return anthropic.Anthropic(api_key=api_key)
+# ---------------------------------------------------------------------------
+# Provider dispatch
+# ---------------------------------------------------------------------------
+
+def _call_llm(
+    provider: str,
+    api_key: str,
+    system: str,
+    user_prompt: str,
+    max_tokens: int,
+    want_json: bool = False,
+    model_override: Optional[str] = None,
+) -> str:
+    """Call the configured LLM provider and return the response text."""
+    if provider == PROVIDER_OPENAI:
+        return _call_openai(api_key, system, user_prompt, max_tokens, want_json, model_override)
+    return _call_anthropic(api_key, system, user_prompt, max_tokens, model_override)
 
 
-def _extract_text(response) -> str:
+def _call_anthropic(api_key, system, user_prompt, max_tokens, model_override=None) -> str:
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model=model_override or DEFAULT_MODEL_ANTHROPIC,
+        max_tokens=max_tokens,
+        system=system,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
     parts = []
     for block in response.content:
         if getattr(block, "type", None) == "text":
@@ -50,22 +77,25 @@ def _extract_text(response) -> str:
     return "".join(parts)
 
 
-def _extract_json(text: str) -> Optional[dict | list]:
-    """Pull a JSON object/array out of model output. Tolerates code fences and prose."""
-    if not text:
-        return None
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
-    candidate = fenced.group(1).strip() if fenced else text.strip()
-    # Try the whole candidate first; fall back to the first {...} or [...] block.
-    for chunk in (candidate, _first_json_blob(candidate)):
-        if not chunk:
-            continue
-        try:
-            return json.loads(chunk)
-        except json.JSONDecodeError:
-            continue
-    return None
+def _call_openai(api_key, system, user_prompt, max_tokens, want_json=False, model_override=None) -> str:
+    client = openai.OpenAI(api_key=api_key)
+    kwargs = {
+        "model": model_override or DEFAULT_MODEL_OPENAI,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    if want_json:
+        kwargs["response_format"] = {"type": "json_object"}
+    response = client.chat.completions.create(**kwargs)
+    return response.choices[0].message.content or ""
 
+
+# ---------------------------------------------------------------------------
+# JSON extraction (works for both providers)
+# ---------------------------------------------------------------------------
 
 def _first_json_blob(text: str) -> Optional[str]:
     obj_start = text.find("{")
@@ -88,36 +118,78 @@ def _first_json_blob(text: str) -> Optional[str]:
     return None
 
 
-def validate_api_key(api_key: str) -> tuple[bool, str]:
+def _extract_json(text: str):
+    if not text:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    candidate = fenced.group(1).strip() if fenced else text.strip()
+    for chunk in (candidate, _first_json_blob(candidate)):
+        if not chunk:
+            continue
+        try:
+            return json.loads(chunk)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# API key validation
+# ---------------------------------------------------------------------------
+
+def validate_api_key(provider: str, api_key: str) -> tuple[bool, str]:
     """Cheap test call to confirm the key works. Returns (ok, message)."""
+    if provider not in SUPPORTED_PROVIDERS:
+        return False, f"Unsupported provider: {provider}"
     if not api_key or not api_key.strip():
         return False, "API key is empty."
     try:
-        client = _client(api_key.strip())
-        client.messages.create(
-            model=DEFAULT_MODEL,
-            max_tokens=8,
-            messages=[{"role": "user", "content": "ping"}],
-        )
+        if provider == PROVIDER_OPENAI:
+            client = openai.OpenAI(api_key=api_key.strip())
+            client.chat.completions.create(
+                model=DEFAULT_MODEL_OPENAI,
+                max_tokens=8,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+        else:
+            client = anthropic.Anthropic(api_key=api_key.strip())
+            client.messages.create(
+                model=DEFAULT_MODEL_ANTHROPIC,
+                max_tokens=8,
+                messages=[{"role": "user", "content": "ping"}],
+            )
         return True, "API key validated."
     except anthropic.AuthenticationError:
-        return False, "Invalid API key. Please check the key and try again."
+        return False, "Invalid Anthropic API key."
     except anthropic.PermissionDeniedError:
-        return False, "API key lacks permission to call this model."
+        return False, "Anthropic API key lacks permission."
     except anthropic.RateLimitError:
-        return False, "Rate limited while validating. The key looks valid; try again in a moment."
+        return False, "Rate limited; the key looks valid. Try again in a moment."
     except anthropic.APIConnectionError:
-        return False, "Could not reach the Anthropic API. Check your network."
+        return False, "Could not reach the Anthropic API."
+    except openai.AuthenticationError:
+        return False, "Invalid OpenAI API key."
+    except openai.PermissionDeniedError:
+        return False, "OpenAI API key lacks permission."
+    except openai.RateLimitError:
+        return False, "Rate limited; the key looks valid. Try again in a moment."
+    except openai.APIConnectionError:
+        return False, "Could not reach the OpenAI API."
     except Exception as e:
         return False, f"Unexpected error validating key: {e}"
 
 
-def suggest_account_mapping(api_key: str, accounts_df: pd.DataFrame, entity_type: str) -> pd.DataFrame:
-    """Ask Claude to assign GAAP statement, group, and line_item to each account.
+# ---------------------------------------------------------------------------
+# Account mapping suggestion
+# ---------------------------------------------------------------------------
 
-    Returns the input dataframe with `statement`, `group`, and `line_item`
-    populated where the model could classify them.
-    """
+def suggest_account_mapping(
+    provider: str,
+    api_key: str,
+    accounts_df: pd.DataFrame,
+    entity_type: str,
+) -> pd.DataFrame:
+    """Ask the LLM to assign GAAP statement, group, and line_item to each account."""
     if accounts_df is None or accounts_df.empty:
         return accounts_df
 
@@ -140,22 +212,25 @@ For each account, return:
 - line_item: a standard GAAP caption (e.g., "Cash and cash equivalents", \
 "Accounts receivable, net", "Long-term debt, net of current portion")
 
-Return ONLY a JSON array. Each element MUST have keys: account_number, \
-account_description, statement, group, line_item.
+Return ONLY a JSON object with key "accounts" mapping to an array. Each array \
+element MUST have keys: account_number, account_description, statement, group, line_item.
 
 Accounts to classify:
 {json.dumps(rows, indent=2)}
 """
 
-    client = _client(api_key)
-    response = client.messages.create(
-        model=DEFAULT_MODEL,
-        max_tokens=8000,
+    text = _call_llm(
+        provider=provider,
+        api_key=api_key,
         system="You are an expert CPA classifying chart-of-accounts entries to GAAP financial statement line items. Return strict JSON only.",
-        messages=[{"role": "user", "content": user_prompt}],
+        user_prompt=user_prompt,
+        max_tokens=8000,
+        want_json=True,
     )
-    text = _extract_text(response)
     parsed = _extract_json(text)
+    # Accept either {"accounts": [...]} (preferred for OpenAI json_object) or a bare array.
+    if isinstance(parsed, dict) and "accounts" in parsed:
+        parsed = parsed["accounts"]
     if not isinstance(parsed, list):
         return accounts_df
 
@@ -181,7 +256,12 @@ Accounts to classify:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Note generation
+# ---------------------------------------------------------------------------
+
 def generate_all_notes(
+    provider: str,
     api_key: str,
     entity_name: str,
     entity_type: str,
@@ -190,10 +270,7 @@ def generate_all_notes(
     required_notes: list[str],
     prior_year_notes_text: str = "",
 ) -> list[dict]:
-    """Generate the full initial set of notes in one call.
-
-    Returns: list of dicts with keys: title, narrative, table_data (list of dicts | []), table_columns (list[str]).
-    """
+    """Generate the full initial set of notes in one call."""
     pyn = ""
     if prior_year_notes_text:
         pyn = f"\nPrior year note language (use as a starting point; update figures to current year):\n{prior_year_notes_text[:6000]}\n"
@@ -210,7 +287,8 @@ Financial statement summary (current and prior year amounts by line item):
 Required notes (in order):
 {json.dumps(required_notes, indent=2)}
 {pyn}
-Return ONLY a JSON array. Each element MUST have these keys:
+Return ONLY a JSON object with key "notes" mapping to an array. Each array \
+element MUST have these keys:
 - title: the note title (e.g., "Note 1 - Summary of Significant Accounting Policies")
 - narrative: formal disclosure prose. Use real dollar figures from the data. \
 Use [CONFIRM: ...] for any figure or fact you cannot derive from the data.
@@ -224,17 +302,17 @@ property and equipment, net asset rollforward, etc.), populate table_data and \
 table_columns. Note 1 is always Summary of Significant Accounting Policies.
 """
 
-    system = SYSTEM_NOTE_DRAFTER.format(entity_type=entity_type)
-
-    client = _client(api_key)
-    response = client.messages.create(
-        model=DEFAULT_MODEL,
-        max_tokens=16000,
-        system=system,
-        messages=[{"role": "user", "content": user_prompt}],
+    text = _call_llm(
+        provider=provider,
+        api_key=api_key,
+        system=SYSTEM_NOTE_DRAFTER.format(entity_type=entity_type),
+        user_prompt=user_prompt,
+        max_tokens=16000 if provider == PROVIDER_ANTHROPIC else 8000,
+        want_json=True,
     )
-    text = _extract_text(response)
     parsed = _extract_json(text)
+    if isinstance(parsed, dict) and "notes" in parsed:
+        parsed = parsed["notes"]
     if not isinstance(parsed, list):
         return []
     cleaned = []
@@ -251,6 +329,7 @@ table_columns. Note 1 is always Summary of Significant Accounting Policies.
 
 
 def regenerate_note(
+    provider: str,
     api_key: str,
     entity_name: str,
     entity_type: str,
@@ -260,10 +339,7 @@ def regenerate_note(
     mode: str = "redo",
     existing_narrative: str = "",
 ) -> dict:
-    """Regenerate a single note: redo from scratch, expand, or apply a custom instruction.
-
-    mode: 'redo' | 'expand' | 'custom'
-    """
+    """Regenerate a single note: redo from scratch, expand, or apply a custom instruction."""
     if mode == "redo":
         directive = "Generate this note from scratch, taking a different approach than before."
     elif mode == "expand":
@@ -288,15 +364,14 @@ Instruction:
 Return ONLY a JSON object with keys: title, narrative, table_data, table_columns.
 """
 
-    system = SYSTEM_NOTE_DRAFTER.format(entity_type=entity_type)
-    client = _client(api_key)
-    response = client.messages.create(
-        model=DEFAULT_MODEL,
+    text = _call_llm(
+        provider=provider,
+        api_key=api_key,
+        system=SYSTEM_NOTE_DRAFTER.format(entity_type=entity_type),
+        user_prompt=user_prompt,
         max_tokens=6000,
-        system=system,
-        messages=[{"role": "user", "content": user_prompt}],
+        want_json=True,
     )
-    text = _extract_text(response)
     parsed = _extract_json(text)
     if not isinstance(parsed, dict):
         return {"title": note_title, "narrative": text.strip(), "table_data": [], "table_columns": []}
@@ -309,6 +384,7 @@ Return ONLY a JSON object with keys: title, narrative, table_data, table_columns
 
 
 def generate_single_note(
+    provider: str,
     api_key: str,
     entity_name: str,
     entity_type: str,
@@ -327,15 +403,15 @@ Financial statement summary:
 
 Return ONLY a JSON object with keys: title, narrative, table_data, table_columns.
 """
-    system = SYSTEM_NOTE_DRAFTER.format(entity_type=entity_type)
-    client = _client(api_key)
-    response = client.messages.create(
-        model=DEFAULT_MODEL,
+
+    text = _call_llm(
+        provider=provider,
+        api_key=api_key,
+        system=SYSTEM_NOTE_DRAFTER.format(entity_type=entity_type),
+        user_prompt=user_prompt,
         max_tokens=4000,
-        system=system,
-        messages=[{"role": "user", "content": user_prompt}],
+        want_json=True,
     )
-    text = _extract_text(response)
     parsed = _extract_json(text)
     if not isinstance(parsed, dict):
         return {"title": note_topic, "narrative": text.strip(), "table_data": [], "table_columns": []}

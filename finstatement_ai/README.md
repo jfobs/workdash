@@ -8,7 +8,8 @@ The app is stateless — no database. All work lives in `st.session_state`, and 
 
 ## Features
 
-- **API key gate** — enter your Anthropic API key once per session; it's validated with a lightweight Claude call and held only in memory.
+- **Dual-provider LLM support** — choose **Anthropic (Claude)** or **OpenAI (GPT)** at the API key gate. The same prompts work against both via the official `anthropic` and `openai` SDKs (no shims). Default is Claude.
+- **API key gate** — pick the provider, enter the key, and it's validated with a lightweight test call. Held only in `st.session_state`.
 - **Source data ingestion** — upload either a prior-year financial statement (Excel/CSV) or a current-year trial balance / grouping report. Auto-detects column headers; falls back to Claude-suggested mappings when no grouping column is present.
 - **Editable statements** — Balance Sheet / Statement of Financial Position, Income Statement / Statement of Activities, Cash Flow (indirect or direct), Statement of Changes in Equity, Statement of Functional Expenses. Subtotals and totals recalculate on demand; balance-sheet equilibrium check.
 - **GAAP disclosure checklist** — persistent sidebar driven by a rules engine that triggers items based on entity type, statements selected, and account balances (cash, receivables, inventory, PP&E, debt, leases, taxes, net assets, etc.). Users can override any item's status.
@@ -23,7 +24,8 @@ The app is stateless — no database. All work lives in `st.session_state`, and 
 
 - Python 3.11+
 - Streamlit (multi-page via the `pages/` folder)
-- `anthropic` Python SDK (defaults to `claude-sonnet-4-5`)
+- `anthropic` Python SDK (default: `claude-sonnet-4-5`)
+- `openai` Python SDK (default: `gpt-4o`)
 - `pandas`, `openpyxl`
 - `reportlab` for PDF assembly
 - `python-dotenv` for local-dev convenience (the app does not require a `.env` file)
@@ -54,11 +56,21 @@ finstatement_ai/
 
 ## Setup
 
-### 1. Get an Anthropic API key
+### 1. Get an API key (Anthropic or OpenAI)
 
+Pick one of the following — you only need a key for the provider you want to use, but you can switch between them at runtime.
+
+**Anthropic (Claude, the default):**
 1. Visit [console.anthropic.com](https://console.anthropic.com) and create an account (or sign in).
 2. Go to **API Keys** and click **Create Key**.
-3. Copy the key (it starts with `sk-ant-...`). You'll paste it into the app's sidebar — the key is held in `st.session_state` only and never written to disk.
+3. Copy the key (it starts with `sk-ant-...`).
+
+**OpenAI (GPT):**
+1. Visit [platform.openai.com/api-keys](https://platform.openai.com/api-keys) and create an account (or sign in).
+2. Click **Create new secret key**.
+3. Copy the key (it starts with `sk-...`).
+
+You'll paste the key into the app's sidebar after picking the provider — the key is held in `st.session_state` only and never written to disk.
 
 ### 2. Run locally
 
@@ -120,20 +132,25 @@ Numeric columns tolerate `$` signs, commas, and parentheses-as-negatives.
 
 ---
 
-## Switching to a different Claude model
+## Switching models
 
-The default model is `claude-sonnet-4-5`. To use Sonnet 4.6 (the latest) or another model, edit `DEFAULT_MODEL` at the top of `utils/ai_engine.py`. The original spec named `claude-sonnet-4-20250514`, which is the deprecated original Sonnet 4.0 — `claude-sonnet-4-5` is its drop-in replacement.
+The defaults are set at the top of `utils/ai_engine.py`:
+
+- `DEFAULT_MODEL_ANTHROPIC = "claude-sonnet-4-5"` — swap for `claude-sonnet-4-6` (latest), `claude-opus-4-7` (most capable), `claude-haiku-4-5` (fastest), or another supported alias.
+- `DEFAULT_MODEL_OPENAI = "gpt-4o"` — swap for any model your OpenAI account can access (e.g. `gpt-4o-mini` for cost, or a newer release).
+
+The original spec named `claude-sonnet-4-20250514`, which is the deprecated original Sonnet 4.0 — `claude-sonnet-4-5` is its drop-in replacement.
 
 ---
 
 ## Notes on cost and rate limits
 
-- The app makes one validation call when the API key is entered.
-- Trial-balance mapping is one Claude call (skipped if your file already has a Group/Statement/Line Item column).
-- Initial note generation is one large Claude call covering all triggered disclosures.
-- Each Redo / Expand / Edit Prompt action is one additional Claude call against a single note.
+- The app makes one validation call when the API key is entered (against whichever provider you chose).
+- Trial-balance mapping is one LLM call (skipped if your file already has a Group/Statement/Line Item column).
+- Initial note generation is one large LLM call covering all triggered disclosures.
+- Each Redo / Expand / Edit Prompt action is one additional LLM call against a single note.
 
-For very large note sets you may hit your tier's per-minute token limits. Re-run the failing action — the SDK retries 429s with exponential backoff automatically.
+For very large note sets you may hit your tier's per-minute token limits. Re-run the failing action — both SDKs retry 429s with exponential backoff automatically.
 
 ---
 
